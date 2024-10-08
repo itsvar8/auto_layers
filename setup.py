@@ -27,7 +27,12 @@ def active_window_process_name():
 
 
 def list_all_processes():
-    return [process.name() for process in psutil.process_iter()]
+    processes = list()
+    try:
+        processes = [process.name() for process in psutil.process_iter()]
+    except Exception as e:
+        print(e)
+    return processes
 
 
 @dataclass(slots=True)
