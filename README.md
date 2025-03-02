@@ -184,7 +184,7 @@ void raw_hid_receive_kb(uint8_t *data, uint8_t length) {
 }
 ```
 
-[sample keymap](https://github.com/itsvar8/vial-qmk/blob/cstc40/keyboards/kprepublic/cstc40/single_pcb/keymaps/vial/keymap.c)
+[Sample keymap](https://github.com/itsvar8/vial-qmk/blob/cstc40/keyboards/kprepublic/cstc40/single_pcb/keymaps/vial/keymap.c)
 
 For QMK:
 
