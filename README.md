@@ -4,7 +4,7 @@
 A tool to switch layer automatically on QMK and VIAL-QMK keyboards in function of the active window.
 
 If you are going to fork:\
-It relays on https://github.com/apmorton/pyhidapi and https://github.com/Infinidat/infi.systray so check the documentation especially for pyhidapi that needs extra steps to work.
+It relays on [pyhidapi](https://github.com/apmorton/pyhidapi) and [PySide6](https://pypi.org/project/PySide6/) so check the documentation especially for pyhidapi that needs extra steps to work.
 ## Warning
 I just started learning Python so read the code and be careful.\
 I'm not responsible for anything that might happen to you, your hardware or your software using this program.

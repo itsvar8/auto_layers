@@ -59,7 +59,11 @@ def send_raw_report(data, vendor_id=DEFAULT_VENDOR_ID, product_id=DEFAULT_PRODUC
         if len(raw_hid_interfaces) == 0:
             return None
 
-        my_interface = hid.Device(path=raw_hid_interfaces[0]["path"])
+        try:
+            my_interface = hid.Device(path=raw_hid_interfaces[0]["path"])
+        except Exception as e:
+            print(e)
+            my_interface = None
 
         if __name__ == "__main__":
             print(f"Manufacturer: {my_interface.manufacturer}")

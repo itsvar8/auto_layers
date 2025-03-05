@@ -4,62 +4,147 @@ import time
 from configparser import ConfigParser
 from dataclasses import fields, asdict
 from pathlib import Path
+
+from PySide6.QtCore import QObject, QRunnable, Signal, QThreadPool
+from PySide6.QtGui import QIcon, QAction
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
+
 from raw_hid import send_raw_report, REQUEST_IDS, list_qmk_devices
-from setup import Matches, ICONS, SysTrayIcon, active_window_process_name, WE_ARE_NOT_FRIENDS, list_all_processes
+from setup import Matches, Icons, active_window_process_name, WE_ARE_NOT_FRIENDS, list_all_processes, States
+
+
+class WorkerSignals(QObject):
+    finished = Signal()
+    update_devices = Signal()
+    icon_update = Signal()
+    layer_change = Signal()
+    block_check = Signal()
+
+
+class Worker(QRunnable):
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+
+        self.kwargs["update_devices_signal"] = self.signals.update_devices
+        self.kwargs["icon_update_signal"] = self.signals.icon_update
+        self.kwargs["layer_change_signal"] = self.signals.layer_change
+        self.kwargs["block_check_signal"] = self.signals.block_check
+
+    def run(self):
+        try:
+            self.fn(*self.args, **self.kwargs)
+        except Exception as e:
+            print(e)
+        finally:
+            self.signals.finished.emit()
 
 
 class AutoLayers:
-    selected_device = None
-
-    def __init__(self):
+    def __init__(self, q_app):
+        self.app = q_app
+        self.threadpool = QThreadPool()
         self.vid = -1
         self.pid = -1
         self.name = "NONE"
         self.matches = Matches()
-        self.pause = False
-        self.quit = False
-        self.reboot = False
         self.devices = list_qmk_devices()
-        self.icon_change_skip = False
         self.block_list = WE_ARE_NOT_FRIENDS
         self.block_if_active = set()
+        self.state = States.RUNNING
+        self.state_before_block = self.state
 
-        # systray
-        self.pause_resume_option = ("Pause/Resume", ICONS.pause_resume, self.pause_resume)
-        self.grab_option = ("Grab", ICONS.grab, self.grab)
-        self.remove_option = ("Remove", ICONS.remove, self.remove)
-        if len(self.devices) > 0:
-            self.devices_option_sub = list()
-            for device in self.devices:
-                name = device["name"]
-                icon = ICONS.device if not name == AutoLayers.selected_device else ICONS.running
-                self.create_method(name)
-                self.devices_option_sub.append((name, icon, getattr(self, name)))
-            self.devices_option = ("Devices", ICONS.device, self.devices_option_sub)
-            self.menu_options = (self.pause_resume_option, self.grab_option, self.remove_option, self.devices_option)
-        else:
-            self.menu_options = (self.pause_resume_option, self.grab_option, self.remove_option)
+        # create the tray
+        self.tray = QSystemTrayIcon()
+        self.tray.setIcon(QIcon(Icons.RUNNING))
+        self.tray.activated.connect(self.tray_activated)
+        self.tray.setVisible(True)
 
-        self.systray = SysTrayIcon(
-            icon=ICONS.running,
-            hover_text="Auto Layers",
-            menu_options=self.menu_options,
-            on_quit=self.on_quit_callback,
-            default_menu_index=0,
-        )
+        # create the menu
+        self.menu = QMenu()
+
+        # menu options
+        self.pause_resume_action = QAction(QIcon(Icons.PAUSE_RESUME), "Pause/Resume")
+        self.pause_resume_action.triggered.connect(self.pause_resume)
+
+        self.grab_action = QAction(QIcon(Icons.GRAB), "Grab")
+        self.grab_action.triggered.connect(self.grab)
+
+        self.remove_action = QAction(QIcon(Icons.REMOVE), "Remove")
+        self.remove_action.triggered.connect(self.remove)
+
+        self.quit_action = QAction(QIcon(Icons.QUIT), "Quit")
+        self.quit_action.triggered.connect(self.quit)
+
+        self.default_menu_actions = [
+            self.pause_resume_action,
+            self.grab_action,
+            self.remove_action,
+            self.quit_action,
+        ]
+        self.menu.addActions(self.default_menu_actions)
+
+        self.devices_menu = QMenu(parent=self.menu)
+        self.devices_menu.setTitle("Devices")
+        self.devices_menu.setIcon(QIcon(Icons.DEVICE))
+
+        self.device_action = None
+
+        self.no_devices_action = QAction("No devices")
+        self.no_devices_action.setDisabled(True)
+        self.devices_menu.addAction(self.no_devices_action)
+
+        self.menu.insertMenu(self.quit_action, self.devices_menu)
+
+        # Add the menu to the tray
+        self.tray.setContextMenu(self.menu)
+
+        self.update_devices()
 
         # try to load config.ini
         self.config = ConfigParser()
-        self.load_config(self.name)
+        self.load_config()
 
-    def create_method(self, device_name):
-        def method(_systray):
-            self.load_config(device_name)
+        self.run()
 
-        method.__name__ = device_name
-        setattr(self, method.__name__, method)
+    def quit(self):
+        self.save_config()
+        self.state = States.QUITTING
 
-    def load_config(self, device_name):
+    def tray_activated(self, reason):
+        if self.state == States.BLOCKED:
+            return
+        if reason == QSystemTrayIcon.DoubleClick:  # noqa
+            self.pause_resume()
+
+    def change_device(self, _checked, device_name):
+        self.name = device_name
+        self.load_config()
+
+    def update_devices(self):
+        self.devices = list_qmk_devices()
+
+        self.no_devices_action.setVisible(True)  # empty a menu while open crashes
+
+        for action in [a for a in self.devices_menu.actions() if not a.text() == "No devices"]:
+            self.devices_menu.removeAction(action)
+
+        if len(self.devices) == 0:
+            return
+
+        for device in self.devices:
+            name = device["name"]
+            self.device_action = QAction(name, parent=self.devices_menu)
+            self.device_action.triggered.connect(lambda checked, n=name: self.change_device(checked, n))
+            self.devices_menu.addAction(self.device_action)
+
+        self.no_devices_action.setVisible(False)
+
+    def load_config(self):
         self.config.read(Path(CONFIG_FOLDER, "config.ini"))
         try:
             if self.config.has_option("general", "block_list"):
@@ -68,7 +153,6 @@ class AutoLayers:
             if self.config.has_option("general", "block_if_active"):
                 self.block_if_active = eval(self.config["general"]["block_if_active"])
 
-            self.name = device_name
             if self.config.has_option("general", "last_device") and self.name == "NONE":
                 self.name = self.config["general"]["last_device"]
 
@@ -90,12 +174,8 @@ class AutoLayers:
             print(f"Bad config.ini, {e = }, {self.name = }, {self.vid = }, {self.pid = }")
             sys.exit()
 
-        self.pause_resume(force="pause") if self.name == "NONE" else self.pause_resume(force="resume")
+        self.pause_resume(force=States.PAUSED) if self.name == "NONE" else self.pause_resume(force=States.RUNNING)
         print(self.name, self.vid, self.pid)
-
-        if not AutoLayers.selected_device == self.name:
-            AutoLayers.selected_device = self.name
-            self.reboot = True
 
     def save_config(self):
         self.config.read_dict(asdict(self.matches))
@@ -121,71 +201,79 @@ class AutoLayers:
                 self.config.remove_section(section)
 
         with open(Path(CONFIG_FOLDER, "config.ini"), "w") as configfile:
-            self.config.write(configfile)
+            self.config.write(configfile)  # noqa
         print("config.ini saved")
 
-    def remove(self, _systray):
-        time.sleep(4)
-        active_window = active_window_process_name()
-        for _field in fields(self.matches):
-            getattr(self.matches, _field.name)["apps"].discard(active_window)
-        print(active_window, "removed")
-        self.save_config()
-        self.icon_update(seconds=2, icon=ICONS.remove)
+    def icon_update(self):
+        match self.state:
+            case States.RUNNING:
+                icon = Icons.RUNNING
+            case States.PAUSED:
+                icon = Icons.PAUSED
+            case States.BLOCKED:
+                icon = Icons.BLOCKED
+            case States.GRABBING:
+                icon = Icons.GRAB
+            case States.REMOVING:
+                icon = Icons.REMOVE
+            case _:
+                icon = Icons.QUIT
+        self.tray.setIcon(QIcon(icon))
 
-    def grab(self, _systray):
-        current_state = self.pause
-        self.pause = True
+        for device in self.devices_menu.actions():
+            if device.text() == self.name:
+                device.setIcon(QIcon(Icons.RUNNING))
+            else:
+                device.setIcon(QIcon(Icons.DEVICE))
+
+    def pause_resume(self, *_args, force: States | None = None):
+        if not force:
+            self.state = States.RUNNING if self.state == States.PAUSED else States.PAUSED
+        else:
+            self.state = force
+        self.icon_update()
+
+    def grab(self):
+        current_state = self.state
+        self.state = States.PAUSED
         time.sleep(4)
         current_layer = send_raw_report(REQUEST_IDS.id_current_layer, self.vid, self.pid)
         active_window = active_window_process_name()
-        if active_window in self.block_list | self.block_if_active:
-            self.pause = False
+        if active_window in self.block_list.union(self.block_if_active):
+            self.state = current_state
             return
         if not current_layer == "0" and not current_layer is None:
+            self.state = States.GRABBING
+            self.icon_update()
             for _field in fields(self.matches):
                 getattr(self.matches, _field.name)["apps"].discard(active_window)
             getattr(self.matches, f"layer_{current_layer}")["apps"].add(active_window)
             print(getattr(self.matches, f"layer_{current_layer}"))
             self.save_config()
-            self.icon_update(seconds=2, icon=ICONS.grab)
-        self.pause = current_state
+            time.sleep(2)
+        self.state = current_state
+
+    def remove(self):
+        current_state = self.state
+        time.sleep(4)
+        self.state = States.REMOVING
         self.icon_update()
-
-    def pause_resume(self, *_args, force=None):
-        if not force:
-            self.pause = not self.pause
-        else:
-            self.pause = True if force == "pause" else False
-
-        if self.name == "NONE":
-            self.pause = True
-
-        self.icon_update()
-
-    def icon_update(self, seconds=None, icon=None):
-        if self.icon_change_skip:
-            return
-        if seconds and icon:
-            self.systray.update(icon=icon)
-            self.icon_change_skip = True
-            time.sleep(seconds)
-            self.icon_change_skip = False
-        if self.pause:
-            self.systray.update(icon=ICONS.paused)
-        else:
-            self.systray.update(icon=ICONS.running)
-
-    def on_quit_callback(self, _systray):
-        if not self.quit:  # self.systray._destroy fires 2 times on reboot
-            self.save_config()
-        self.quit = True
+        active_window = active_window_process_name()
+        for _field in fields(self.matches):
+            getattr(self.matches, _field.name)["apps"].discard(active_window)
+        print(active_window, "removed")
+        self.save_config()
+        time.sleep(2)
+        self.state = current_state
 
     def layer_change(self):
         current_layer = send_raw_report(REQUEST_IDS.id_current_layer, self.vid, self.pid)
         if current_layer is None:
             return
         active_window = active_window_process_name()
+        if active_window_process_name() is None:
+            print("no active window")
+            return
         found = False
         for f in fields(self.matches):
             if not active_window in getattr(self.matches, f.name)["apps"]:
@@ -197,46 +285,87 @@ class AutoLayers:
         if not found and not current_layer == "0":
             send_raw_report(REQUEST_IDS.id_layer_0, self.vid, self.pid)
 
-    def run(self):
-        self.systray.start()
-        timer = time.monotonic()
-        while not self.quit:
+    def block_check(self):
+        if self.state == States.QUITTING:
+            return
+
+        if not self.state == States.BLOCKED:
+            self.state_before_block = self.state
+
+        if (
+            any(process in self.block_list for process in list_all_processes())
+            or active_window_process_name() in self.block_if_active
+        ):
+            self.state = States.BLOCKED
+            self.pause_resume_action.setDisabled(True)
+            self.grab_action.setDisabled(True)
+            self.remove_action.setDisabled(True)
+        else:
+            self.state = self.state_before_block
+            self.pause_resume_action.setDisabled(False)
+            self.grab_action.setDisabled(False)
+            self.remove_action.setDisabled(False)
+
+        self.icon_update()
+
+    @staticmethod
+    def loop(
+        autolayers,
+        update_devices_signal,
+        icon_update_signal,
+        layer_change_signal,
+        block_check_signal,
+    ):
+        scan_devices_timer = time.monotonic()
+        while not autolayers.state == States.QUITTING:
             time.sleep(0.5)
-            if self.reboot:
-                self.systray.shutdown()
-                return True
-            if (
-                any(app in self.block_list for app in list_all_processes())
-                or active_window_process_name() in self.block_if_active
-            ):
-                self.systray.update(icon=ICONS.blocked)
+
+            block_check_signal.emit()
+            if autolayers.state == States.BLOCKED:
                 continue
-            if active_window_process_name() is None:
-                print("no active window")
+
+            if not autolayers.state in (States.PAUSED, States.BLOCKED):
+                layer_change_signal.emit()
+
+            icon_update_signal.emit()
+
+            if int(time.monotonic() - scan_devices_timer) <= 4:
                 continue
-            if not self.pause:
-                self.layer_change()
-            self.icon_update()
-            if int(time.monotonic() - timer) <= 5:
-                continue
-            timer = time.monotonic()
-            if not self.devices == list_qmk_devices():
+            scan_devices_timer = time.monotonic()
+            if not autolayers.devices == list_qmk_devices():
                 print("devices changed")
-                self.reboot = True
+                update_devices_signal.emit()
+
         # return to default layer on quit
-        send_raw_report(REQUEST_IDS.id_layer_0, self.vid, self.pid)
-        return False
+        send_raw_report(REQUEST_IDS.id_layer_0, autolayers.vid, autolayers.pid)
+
+    def update_devices_signal(self):
+        self.update_devices()
+        self.load_config()
+
+    def finished_signal(self):
+        self.threadpool.waitForDone()
+        self.app.quit()
+
+    def run(self):
+        worker = Worker(self.loop, self)
+        worker.signals.update_devices.connect(self.update_devices_signal)
+        worker.signals.icon_update.connect(self.icon_update)
+        worker.signals.layer_change.connect(self.layer_change)
+        worker.signals.block_check.connect(self.block_check)
+        worker.signals.finished.connect(self.finished_signal)
+        self.threadpool.start(worker)
 
 
 if __name__ == "__main__":
     # this is needed to find icons after using pyinstaller and not saving config.ini in temp
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        os.chdir(sys._MEIPASS)
+        os.chdir(sys._MEIPASS)  # noqa
         CONFIG_FOLDER = os.path.dirname(sys.executable)
     else:
         CONFIG_FOLDER = "."
 
-    while True:
-        auto_layers = AutoLayers()
-        if not auto_layers.run():
-            break
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    auto_layers = AutoLayers(app)
+    app.exec()
